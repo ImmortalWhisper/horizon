@@ -408,6 +408,11 @@ pub struct Streaming {
     deferred: Vec<Done>,
     sequence: u64,
     pub center: (i32, i32),
+    /// Previous chunk centre and the most recent direction and speed.
+    last_center: Option<(i32, i32)>,
+    heading: (i32, i32),
+    heading_lead: i32,
+    heading_idle_updates: u8,
     /// The view distance around `center`; below 0, no area there (a dedicated
     /// server nobody is on).
     pub radius: i32,
@@ -499,6 +504,8 @@ struct GenerationInputs<'a> {
     decorates: bool,
     remote: bool,
     loading: bool,
+    heading: (i32, i32),
+    heading_lead: i32,
 }
 impl GenerationScan {
     /// None means the scan was skipped; Some preserves the original candidate
@@ -517,6 +524,15 @@ impl GenerationScan {
             return None;
         }
         {
+            let priority = |x, z| {
+                input.ranges.priority_ahead(
+                    x,
+                    z,
+                    input.loading,
+                    input.heading,
+                    input.heading_lead,
+                )
+            };
             let mut wanted = Vec::new();
             // Each area's square of columns, as one run per row. Players'
             // areas overlap (a server's players often stand together), so
@@ -549,7 +565,7 @@ impl GenerationScan {
                     {
                         continue;
                     }
-                    wanted.push((input.ranges.priority(x, z, input.loading), x, z));
+                    wanted.push((priority(x, z), x, z));
                 }
             }
             // Forced chunks and their generation neighbourhood: the ring that
@@ -571,7 +587,7 @@ impl GenerationScan {
                         {
                             continue;
                         }
-                        wanted.push((input.ranges.priority(x, z, input.loading), x, z));
+                        wanted.push((priority(x, z), x, z));
                     }
                 }
             }
@@ -826,6 +842,10 @@ impl Streaming {
             deferred: Vec::new(),
             sequence: 0,
             center: (0, 0),
+            last_center: None,
+            heading: (0, 0),
+            heading_lead: 1,
+            heading_idle_updates: 0,
             radius: 8,
             forced: HashSet::new(),
             paused: false,
@@ -1087,7 +1107,8 @@ impl Streaming {
     }
     /// The order jobs around the player run in, lowest first.
     fn distance(&self, x: i32, z: i32) -> i64 {
-        self.ranges().priority(x, z, self.loading)
+        self.ranges()
+            .priority_ahead(x, z, self.loading, self.heading, self.heading_lead)
     }
     /// The 3x3 a light job reads: the finished columns, and for a neighbour
     /// that will not finish (past the area), its decorated proto chunk, as
@@ -1232,6 +1253,29 @@ impl Streaming {
         if self.paused {
             return (uploads, Vec::new());
         }
+        if let Some(previous) = self.last_center {
+            if previous != self.center {
+                let dx = i64::from(self.center.0) - i64::from(previous.0);
+                let dz = i64::from(self.center.1) - i64::from(previous.1);
+                let travel = dx.unsigned_abs().max(dz.unsigned_abs());
+                if travel <= 8 {
+                    self.heading = (dx.signum() as i32, dz.signum() as i32);
+                    self.heading_lead = (travel as i32).clamp(1, 4);
+                } else {
+                    // A large teleport is not a reliable indication of direction.
+                    self.heading = (0, 0);
+                    self.heading_lead = 1;
+                }
+                self.heading_idle_updates = 0;
+            } else {
+                self.heading_idle_updates = self.heading_idle_updates.saturating_add(1);
+                if self.heading_idle_updates >= 20 {
+                    self.heading = (0, 0);
+                    self.heading_lead = 1;
+                }
+            }
+        }
+        self.last_center = Some(self.center);
         ExtraCover::refresh(&mut self.cover, &self.extra);
         // The sweeps below walk every loaded column and proto chunk. Run them
         // at once when the view moves and every eighth tick otherwise: a
@@ -1704,6 +1748,8 @@ impl Streaming {
             decorates: self.decorates,
             remote: self.remote,
             loading: self.loading,
+            heading: self.heading,
+            heading_lead: self.heading_lead,
         };
         if let Some(wanted) = self.generation_scan.candidates(input, workers * 3) {
             for (_, x, z) in wanted {
@@ -2133,6 +2179,38 @@ impl Ranges<'_> {
             _ => own,
         }
     }
+    /// Priority relative to a bounded point ahead of the player.
+    /// Extra areas, pregeneration bands and loading ring order keep their rules.
+    fn priority_ahead(
+        &self,
+        x: i32,
+        z: i32,
+        loading: bool,
+        heading: (i32, i32),
+        lead: i32,
+    ) -> i64 {
+        if loading || heading == (0, 0) {
+            return self.priority(x, z, loading);
+        }
+        let center = (
+            self.center.0.saturating_add(heading.0.saturating_mul(lead)),
+            self.center.1.saturating_add(heading.1.saturating_mul(lead)),
+        );
+        let distance = |c: (i32, i32)| {
+            let dx = i64::from(x) - i64::from(c.0);
+            let dz = i64::from(z) - i64::from(c.1);
+            dx * dx + dz * dz
+        };
+        let own = self
+            .extra
+            .iter()
+            .map(|(c, _)| distance(*c))
+            .fold(distance(center), i64::min);
+        match self.band {
+            Some(band) if band.within(x, z, 4) => own.min(band.priority(x, z)),
+            _ => own,
+        }
+    }
     /// Ring by ring: the Chebyshev distance to the nearest centre first, then
     /// the squared distance. Vanilla's chunk tasks run by ticket level, which
     /// spreads one level per ring of chunks (`ChunkTaskPriorityQueue`), so
@@ -2318,6 +2396,25 @@ fn nearest_first<T: Ord>(candidates: &mut Vec<T>, room: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn moving_priority_leads_generation_by_recent_chunk_speed() {
+        let forced = HashSet::new();
+        let ranges = Ranges {
+            center: (0, 0),
+            radius: 8,
+            extra: &[],
+            forced: &forced,
+            cover: None,
+            band: None,
+        };
+        assert_eq!(ranges.priority_ahead(4, 0, false, (1, 0), 4), 0);
+        assert!(ranges.priority_ahead(0, 0, false, (1, 0), 4) > 0);
+        assert_eq!(
+            ranges.priority_ahead(4, 0, true, (1, 0), 4),
+            ranges.priority(4, 0, true)
+        );
+    }
 
     #[test]
     fn mesh_pool_reuses_capacity_with_clean_geometry_state() {
